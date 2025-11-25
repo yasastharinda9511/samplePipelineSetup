@@ -1,0 +1,455 @@
+pipeline {
+    agent {
+        docker { image 'golang-git:1.23' }
+    }
+    
+    environment {
+        // Go environment variables
+        GO_VERSION = '1.23'
+        GOPATH = '/tmp/go-workspace'
+        GOCACHE = '/tmp/go-build-cache'
+        PATH = "/usr/local/bin:/tmp/go-workspace/bin:${env.PATH}"
+        
+        PROJECT_NAME = 'GoLoadBalancer'
+        DOCKER_IMAGE = 'goloadbalancer'
+        DOCKER_REGISTRY = 'docker.io'
+        DOCKER_CREDENTIALS_ID = 'docker-hub-credentials'
+        GIT_REPO = 'https://github.com/yasastharinda9511/GoLoadBalancer.git'
+        
+        // SonarQube (optional)
+        SONARQUBE_SERVER = 'SonarQube'
+    }
+    
+    options {
+        // Keep builds for 30 days
+        buildDiscarder(logRotator(numToKeepStr: '10', daysToKeepStr: '30'))
+        
+        // Add timestamps to console output
+        timestamps()
+        
+        // Timeout for the entire pipeline
+        timeout(time: 30, unit: 'MINUTES')
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                script {
+                    echo '=== Checking out source code ==='
+                    
+                    cleanWs()
+                    
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: '*/main']],  // Change to your branch
+                        userRemoteConfigs: [[url: env.GIT_REPO]]
+                    ])
+                    
+                    // Display commit information
+                    sh '''
+                        echo "Current commit:"
+                        git log -1 --pretty=format:"%h - %an, %ar : %s"
+                    '''
+                }
+            }
+        }
+        
+        stage('Setup Go Environment') {
+            steps {
+                script {
+                    echo '=== Setting up Go environment ==='
+                    sh '''
+                        # Check Go version
+                        go version
+                        
+                        # Set up Go environment
+                        mkdir -p ${GOPATH}/src ${GOPATH}/bin ${GOPATH}/pkg
+                        
+                        # Display Go environment
+                        go env
+                    '''
+                }
+            }
+        }
+        
+        stage('Dependencies') {
+            steps {
+                script {
+                    echo '=== Installing dependencies ==='
+                    sh '''
+                        # Download dependencies
+                        go mod download
+                        
+                        # Verify dependencies
+                        go mod verify
+                        
+                        # Tidy up dependencies
+                        go mod tidy
+                        
+                        # List dependencies
+                        echo "Project dependencies:"
+                        go list -m all
+                    '''
+                }
+            }
+        }
+        
+        stage('Code Quality Check') {
+            parallel {
+                stage('Lint') {
+                    steps {
+                        script {
+                            echo '=== Running golangci-lint ==='
+                            sh '''
+                                
+                                # Use unique cache to avoid conflicts
+                                export GOLANGCI_LINT_CACHE=/tmp/golangci-cache-${BUILD_NUMBER}
+                                mkdir -p ${GOLANGCI_LINT_CACHE}
+                                
+                                echo "golangci-lint version:"
+                                golangci-lint --version
+                                
+                                echo "Running linter..."
+                                golangci-lint run --timeout 5m ./... || true
+                                
+                                # Cleanup cache
+                                rm -rf ${GOLANGCI_LINT_CACHE}
+                            '''
+                        }
+                    }
+                }
+                
+                stage('Format Check') {
+                    steps {
+                        script {
+                            echo '=== Running golangci-lint ==='
+                            sh '''
+                            # golangci-lint is already installed in the Docker image
+                            golangci-lint --version
+                            
+                            # Run linter
+                            golangci-lint run --timeout 5m || true
+                        '''
+                        }
+                    }
+                }
+                
+                stage('Vet') {
+                    steps {
+                        script {
+                            echo '=== Running go vet ==='
+                            sh '''
+                                # Ensure dependencies are tidy
+                                go mod tidy
+                                
+                                # Run vet
+                                go vet ./...
+                                '''
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Security Scan') {
+            steps {
+                script {
+                    echo '=== Running security scan with gosec ==='
+                    sh '''
+                        # Install gosec if not present
+                        if ! command -v gosec &> /dev/null; then
+                            echo "Installing gosec..."
+                            go install github.com/securego/gosec/v2/cmd/gosec@v2.22.5
+                        fi
+                        
+                        # Run security scan
+                        gosec -fmt=json -out=gosec-report.json ./... || true
+                        
+                        # Display summary
+                        if [ -f gosec-report.json ]; then
+                            echo "Security scan completed. Check gosec-report.json for details."
+                        fi
+                    '''
+                }
+            }
+        }
+        
+        stage('Unit Tests') {
+            steps {
+                script {
+                    echo '=== Running unit tests ==='
+                    sh '''
+                        # Run tests with coverage
+                        go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
+                        
+                        # Display coverage report
+                        go tool cover -func=coverage.out
+                        
+                        # Generate HTML coverage report
+                        go tool cover -html=coverage.out -o coverage.html
+                        
+                        # Calculate total coverage
+                        COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}')
+                        echo "Total test coverage: $COVERAGE"
+                    '''
+                }
+            }
+            post {
+                always {
+                    // Publish test results
+                    junit(
+                        testResults: '**/test-results/*.xml',
+                        allowEmptyResults: true
+                    )
+                }
+            }
+        }
+        
+        stage('Build Binary') {
+            steps {
+                script {
+                    echo '=== Building Go binary ==='
+                    sh '''
+                        mkdir -p bin
+                        
+                        echo "Building for Linux (amd64)..."
+                        CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -v -o bin/goloadbalancer-linux-amd64 ./cmd
+                        
+                        echo "Built binaries:"
+                        ls -lh bin/
+                    
+                    '''
+                }
+            }
+        }
+        
+        stage('Build Docker Image') {
+            when {
+                branch 'main'  // Only build Docker image on main branch
+            }
+            steps {
+                script {
+                    echo '=== Building Docker image ==='
+                    
+                    // Build Docker image with multiple tags
+                    def imageTag = "${env.DOCKER_REGISTRY}/${env.DOCKER_IMAGE}:${env.BUILD_NUMBER}"
+                    def latestTag = "${env.DOCKER_REGISTRY}/${env.DOCKER_IMAGE}:latest"
+                    
+                    sh """
+                        # Build Docker image
+                        docker build -t ${imageTag} -t ${latestTag} .
+                        
+                        # Display image info
+                        docker images | grep ${env.DOCKER_IMAGE}
+                        
+                        # Inspect image
+                        docker inspect ${imageTag}
+                    """
+                    
+                    // Store image tags for later stages
+                    env.DOCKER_IMAGE_TAG = imageTag
+                    env.DOCKER_LATEST_TAG = latestTag
+                }
+            }
+        }
+        
+        stage('Docker Security Scan') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    echo '=== Scanning Docker image for vulnerabilities ==='
+                    sh """
+                        # Install Trivy if not present
+                        if ! command -v trivy &> /dev/null; then
+                            echo "Installing Trivy..."
+                            wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | apt-key add -
+                            echo "deb https://aquasecurity.github.io/trivy-repo/deb \$(lsb_release -sc) main" | tee -a /etc/apt/sources.list.d/trivy.list
+                            apt-get update
+                            apt-get install -y trivy
+                        fi
+                        
+                        # Scan image
+                        trivy image --severity HIGH,CRITICAL ${env.DOCKER_IMAGE_TAG} || true
+                    """
+                }
+            }
+        }
+        
+        stage('Push Docker Image') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    echo '=== Pushing Docker image to registry ==='
+                    
+                    withCredentials([usernamePassword(
+                        credentialsId: env.DOCKER_CREDENTIALS_ID,
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASS'
+                    )]) {
+                        sh """
+                            # Login to Docker registry
+                            echo \$DOCKER_PASS | docker login ${env.DOCKER_REGISTRY} -u \$DOCKER_USER --password-stdin
+                            
+                            # Push images
+                            docker push ${env.DOCKER_IMAGE_TAG}
+                            docker push ${env.DOCKER_LATEST_TAG}
+                            
+                            # Logout
+                            docker logout ${env.DOCKER_REGISTRY}
+                        """
+                    }
+                    
+                    echo "Docker images pushed successfully!"
+                    echo "Image: ${env.DOCKER_IMAGE_TAG}"
+                    echo "Latest: ${env.DOCKER_LATEST_TAG}"
+                }
+            }
+        }
+        
+        stage('Archive Artifacts') {
+            steps {
+                script {
+                    echo '=== Archiving build artifacts ==='
+                    archiveArtifacts(
+                        artifacts: 'bin/**',
+                        fingerprint: true,
+                        allowEmptyArchive: true
+                    )
+                }
+            }
+        }
+        
+        stage('Deploy to Development') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                script {
+                    echo '=== Deploying to Development environment ==='
+                    sh '''
+                        # Example: Deploy to dev server
+                        # scp bin/goloadbalancer-linux-amd64 user@dev-server:/path/to/deploy
+                        # ssh user@dev-server "sudo systemctl restart goloadbalancer"
+                        
+                        echo "Deployment to development completed"
+                    '''
+                }
+            }
+        }
+        
+        stage('Deploy to Staging') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    echo '=== Deploying to Staging environment ==='
+                    sh """
+                        # Example: Deploy using Docker Compose
+                        # docker-compose -f docker-compose.staging.yml up -d
+                        
+                        # Example: Deploy to Kubernetes
+                        # kubectl set image deployment/goloadbalancer goloadbalancer=${env.DOCKER_IMAGE_TAG} -n staging
+                        
+                        echo "Deployment to staging completed"
+                    """
+                }
+            }
+        }
+        
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    echo '=== Deploying to Production environment ==='
+                    
+                    // Add manual approval
+                    input(
+                        message: 'Deploy to Production?',
+                        ok: 'Deploy',
+                        submitter: 'admin,release-manager'
+                    )
+                    
+                    sh """
+                        # Example: Deploy to production Kubernetes cluster
+                        # kubectl set image deployment/goloadbalancer goloadbalancer=${env.DOCKER_IMAGE_TAG} -n production
+                        # kubectl rollout status deployment/goloadbalancer -n production
+                        
+                        echo "Deployment to production completed"
+                    """
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                echo '=== Cleanup ==='
+                
+                // Clean workspace
+                cleanWs(
+                    deleteDirs: true,
+                    patterns: [
+                        [pattern: 'bin/**', type: 'INCLUDE'],
+                        [pattern: 'coverage.*', type: 'INCLUDE']
+                    ]
+                )
+                
+                // Remove dangling Docker images
+                sh 'docker system prune -f || true'
+            }
+        }
+        
+        success {
+            script {
+                echo '✅ Pipeline completed successfully!'
+                
+                // Send success notification (example with Slack)
+                /*
+                slackSend(
+                    color: 'good',
+                    message: "✅ Build SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER}\nBranch: ${env.BRANCH_NAME}\nDuration: ${currentBuild.durationString}",
+                    channel: '#ci-cd'
+                )
+                */
+            }
+        }
+        
+        failure {
+            script {
+                echo '❌ Pipeline failed!'
+                
+                // Send failure notification
+                /*
+                slackSend(
+                    color: 'danger',
+                    message: "❌ Build FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}\nBranch: ${env.BRANCH_NAME}\nCheck: ${env.BUILD_URL}",
+                    channel: '#ci-cd'
+                )
+                */
+                
+                // Send email notification
+                /*
+                emailext(
+                    subject: "Failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    body: "Build failed. Check console output at ${env.BUILD_URL}",
+                    to: 'team@example.com'
+                )
+                */
+            }
+        }
+        
+        unstable {
+            script {
+                echo '⚠️ Pipeline is unstable!'
+            }
+        }
+    }
+}

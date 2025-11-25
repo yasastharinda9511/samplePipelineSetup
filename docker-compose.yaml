@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  jenkins:
+    image: jenkins/jenkins:lts-jdk17  # or lts-jdk11
+    container_name: jenkins
+    user: root
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - JAVA_OPTS=-Djenkins.install.runSetupWizard=false
+    restart: unless-stopped
+    # Install Docker CLI inside the container
+    entrypoint: /bin/bash
+    command: >
+      -c "
+      apt-get update &&
+      apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release &&
+      curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg &&
+      echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian bullseye stable' | tee /etc/apt/sources.list.d/docker.list > /dev/null &&
+      apt-get update &&
+      apt-get install -y docker-ce-cli &&
+      /usr/local/bin/jenkins.sh
+      "
+
+volumes:
+  jenkins_home:
